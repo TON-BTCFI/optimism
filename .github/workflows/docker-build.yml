@@ -12,6 +12,7 @@ jobs:
   build:
     name: Build and Test
     runs-on: ubuntu-latest
+    if: contains(github.event.push.commits[0].message, 'op-node:') || contains(github.event.push.commits[0].message, 'op-deployer:')
 
     steps:
       - name: Checkout code
@@ -33,26 +34,28 @@ jobs:
         uses: docker/setup-buildx-action@v2
 
       - name: Build op-node binary
+        if: contains(github.event.push.commits[0].message, 'op-node:')
         run: |
           cd op-node
           export PATH="$PATH:$HOME/bin"
           just op-node
 
       - name: Save op-node binary as artifact
-        if: ${{ !env.ACT }}
+        if: contains(github.event.push.commits[0].message, 'op-node:') && !env.ACT
         uses: actions/upload-artifact@v3
         with:
           name: op-node-binary
           path: op-node/bin/op-node
 
       - name: Build op-deployer binary
+        if: contains(github.event.push.commits[0].message, 'op-deployer:')
         run: |
           cd op-deployer
           export PATH="$PATH:$HOME/bin"
           just
 
       - name: Save op-deployer binary as artifact
-        if: ${{ !env.ACT }}
+        if: contains(github.event.push.commits[0].message, 'op-deployer:') && !env.ACT
         uses: actions/upload-artifact@v3
         with:
           name: op-deployer-binary
@@ -62,7 +65,7 @@ jobs:
     name: Push Docker Images
     needs: build
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/develop'
+    if: github.ref == 'refs/heads/develop' && (contains(github.event.push.commits[0].message, 'op-node:') || contains(github.event.push.commits[0].message, 'op-deployer:'))
 
     steps:
       - name: Checkout code
@@ -81,33 +84,33 @@ jobs:
           just --help
 
       - name: Download op-node binary artifact
-        if: ${{ !env.ACT }}
+        if: contains(github.event.push.commits[0].message, 'op-node:') && !env.ACT
         uses: actions/download-artifact@v3
         with:
           name: op-node-binary
           path: ./op-node/bin
 
       - name: Build op-node binary (fallback for act)
-        if: ${{ env.ACT }}
+        if: contains(github.event.push.commits[0].message, 'op-node:') && env.ACT
         run: |
           cd op-node
           export PATH="$PATH:$HOME/bin"
           just op-node
 
       - name: Download op-deployer binary artifact
-        if: ${{ !env.ACT }}
+        if: contains(github.event.push.commits[0].message, 'op-deployer:') && !env.ACT
         uses: actions/download-artifact@v3
         with:
           name: op-deployer-binary
           path: ./op-deployer/bin
 
       - name: Build op-deployer binary (fallback for act)
-        if: ${{ env.ACT }}
+        if: contains(github.event.push.commits[0].message, 'op-deployer:') && env.ACT
         run: |
           cd op-deployer
           export PATH="$PATH:$HOME/bin"
           just
-
+    
       - name: Log in to Docker Hub
         uses: docker/login-action@v2
         with:
@@ -115,11 +118,12 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Push op-node Docker Image
+        if: contains(github.event.push.commits[0].message, 'op-node:')
         run: |
           docker build -t parthg1901/op-node:latest -f op-node/Dockerfile .
           docker push parthg1901/op-node:latest
-
       - name: Push op-deployer Docker Image
+        if: contains(github.event.push.commits[0].message, 'op-deployer:')
         run: |
-          docker build -t parthg1901/op-deployer:latest . -f op-deployer/Dockerfile
+          docker build -t parthg1901/op-deployer:latest -f op-deployer/Dockerfile .
           docker push parthg1901/op-deployer:latest
