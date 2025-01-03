@@ -121,5 +121,5 @@ jobs:
 
       - name: Push op-deployer Docker Image
         run: |
-          docker build -t parthg1901/op-deployer:latest . -f op-deployer/Dockerfile.default
+          docker build -t parthg1901/op-deployer:latest . -f op-deployer/Dockerfile
           docker push parthg1901/op-deployer:latest
