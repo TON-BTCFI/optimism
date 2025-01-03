@@ -117,11 +117,9 @@ jobs:
       - name: Push op-node Docker Image
         run: |
           docker build -t parthg1901/op-node:latest -f op-node/Dockerfile .
-          docker tag op-node:latest parthg1901/op-node:latest
           docker push parthg1901/op-node:latest
 
       - name: Push op-deployer Docker Image
         run: |
           docker build -t parthg1901/op-deployer:latest . -f op-deployer/Dockerfile.default
-          docker tag op-deployer:latest parthg1901/op-deployer:latest
           docker push parthg1901/op-deployer:latest
