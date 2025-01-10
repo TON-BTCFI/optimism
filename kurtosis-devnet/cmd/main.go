@@ -9,13 +9,20 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/ethereum-optimism/optimism/kurtosis-devnet/pkg/build"
 	"github.com/ethereum-optimism/optimism/kurtosis-devnet/pkg/kurtosis"
+	"github.com/ethereum-optimism/optimism/kurtosis-devnet/pkg/kurtosis/api/engine"
+	"github.com/ethereum-optimism/optimism/kurtosis-devnet/pkg/kurtosis/backend"
+	"github.com/ethereum-optimism/optimism/kurtosis-devnet/pkg/kurtosis/sources/spec"
 	"github.com/ethereum-optimism/optimism/kurtosis-devnet/pkg/serve"
 	"github.com/ethereum-optimism/optimism/kurtosis-devnet/pkg/tmpl"
+	"github.com/ethereum-optimism/optimism/kurtosis-devnet/pkg/util"
 	"github.com/urfave/cli/v2"
 )
+
+const FILESERVER_PACKAGE = "fileserver"
 
 type config struct {
 	templateFile    string
@@ -26,6 +33,7 @@ type config struct {
 	dryRun          bool
 	localHostName   string
 	baseDir         string
+	kurtosisBinary  string
 }
 
 func newConfig(c *cli.Context) (*config, error) {
@@ -37,6 +45,7 @@ func newConfig(c *cli.Context) (*config, error) {
 		environment:     c.String("environment"),
 		dryRun:          c.Bool("dry-run"),
 		localHostName:   c.String("local-hostname"),
+		kurtosisBinary:  c.String("kurtosis-binary"),
 	}
 
 	// Validate required flags
@@ -53,16 +62,26 @@ type staticServer struct {
 	*serve.Server
 }
 
-func launchStaticServer(ctx context.Context, cfg *config) (*staticServer, func(), error) {
+type engineManager interface {
+	EnsureRunning() error
+}
+
+type Main struct {
+	cfg           *config
+	newDeployer   func(opts ...kurtosis.KurtosisDeployerOptions) (deployer, error)
+	engineManager engineManager
+}
+
+func (m *Main) launchStaticServer(ctx context.Context) (*staticServer, func(), error) {
 	// we will serve content from this tmpDir for the duration of the devnet creation
-	tmpDir, err := os.MkdirTemp("", cfg.enclave)
+	tmpDir, err := os.MkdirTemp("", m.cfg.enclave)
 	if err != nil {
 		return nil, nil, fmt.Errorf("error creating temporary directory: %w", err)
 	}
 
 	server := serve.NewServer(
 		serve.WithStaticDir(tmpDir),
-		serve.WithHostname(cfg.localHostName),
+		serve.WithHostname(m.cfg.localHostName),
 	)
 	if err := server.Start(ctx); err != nil {
 		return nil, nil, fmt.Errorf("error starting server: %w", err)
@@ -81,14 +100,14 @@ func launchStaticServer(ctx context.Context, cfg *config) (*staticServer, func()
 		}, nil
 }
 
-func localDockerImageOption(cfg *config) tmpl.TemplateContextOptions {
+func (m *Main) localDockerImageOption() tmpl.TemplateContextOptions {
 	dockerBuilder := build.NewDockerBuilder(
-		build.WithDockerBaseDir(cfg.baseDir),
-		build.WithDockerDryRun(cfg.dryRun),
+		build.WithDockerBaseDir(m.cfg.baseDir),
+		build.WithDockerDryRun(m.cfg.dryRun),
 	)
 
 	imageTag := func(projectName string) string {
-		return fmt.Sprintf("%s:%s", projectName, cfg.enclave)
+		return fmt.Sprintf("%s:%s", projectName, m.cfg.enclave)
 	}
 
 	return tmpl.WithFunction("localDockerImage", func(projectName string) (string, error) {
@@ -96,15 +115,15 @@ func localDockerImageOption(cfg *config) tmpl.TemplateContextOptions {
 	})
 }
 
-func localContractArtifactsOption(cfg *config, server *staticServer) tmpl.TemplateContextOptions {
-	contractsBundle := fmt.Sprintf("contracts-bundle-%s.tar.gz", cfg.enclave)
+func (m *Main) localContractArtifactsOption(server *staticServer) tmpl.TemplateContextOptions {
+	contractsBundle := fmt.Sprintf("contracts-bundle-%s.tar.gz", m.cfg.enclave)
 	contractsBundlePath := func(_ string) string {
 		return filepath.Join(server.dir, contractsBundle)
 	}
 
 	contractBuilder := build.NewContractBuilder(
-		build.WithContractBaseDir(cfg.baseDir),
-		build.WithContractDryRun(cfg.dryRun),
+		build.WithContractBaseDir(m.cfg.baseDir),
+		build.WithContractDryRun(m.cfg.dryRun),
 	)
 
 	return tmpl.WithFunction("localContractArtifacts", func(layer string) (string, error) {
@@ -124,85 +143,108 @@ func localContractArtifactsOption(cfg *config, server *staticServer) tmpl.Templa
 	})
 }
 
-func localPrestateOption(cfg *config, server *staticServer) tmpl.TemplateContextOptions {
+type PrestateInfo struct {
+	URL    string            `json:"url"`
+	Hashes map[string]string `json:"hashes"`
+}
+
+func (m *Main) localPrestateOption(server *staticServer) tmpl.TemplateContextOptions {
 	prestateBuilder := build.NewPrestateBuilder(
-		build.WithPrestateBaseDir(cfg.baseDir),
-		build.WithPrestateDryRun(cfg.dryRun),
+		build.WithPrestateBaseDir(m.cfg.baseDir),
+		build.WithPrestateDryRun(m.cfg.dryRun),
 	)
 
-	return tmpl.WithFunction("localPrestate", func() (string, error) {
+	return tmpl.WithFunction("localPrestate", func() (*PrestateInfo, error) {
 		// Create build directory with the final path structure
 		buildDir := filepath.Join(server.dir, "proofs", "op-program", "cannon")
 		if err := os.MkdirAll(buildDir, 0755); err != nil {
-			return "", fmt.Errorf("failed to create prestate build directory: %w", err)
+			return nil, fmt.Errorf("failed to create prestate build directory: %w", err)
 		}
 
 		// Get the relative path from server.dir to buildDir for the URL
 		relPath, err := filepath.Rel(server.dir, buildDir)
 		if err != nil {
-			return "", fmt.Errorf("failed to get relative path: %w", err)
+			return nil, fmt.Errorf("failed to get relative path: %w", err)
 		}
 
-		url := fmt.Sprintf("%s/%s", server.URL(), relPath)
-
-		if cfg.dryRun {
-			return url, nil
+		info := &PrestateInfo{
+			URL:    fmt.Sprintf("%s/%s", server.URL(), relPath),
+			Hashes: make(map[string]string),
 		}
 
-		// Check if we already have prestate files. Typical in interop mode,
-		// where we have a prestate for each chain.
-		if dir, _ := os.ReadDir(buildDir); len(dir) > 0 {
-			return url, nil
+		if m.cfg.dryRun {
+			return info, nil
+		}
+
+		// Map of known file prefixes to their keys
+		fileToKey := map[string]string{
+			"prestate-proof.json":      "prestate",
+			"prestate-proof-mt64.json": "prestate-mt64",
+			"prestate-proof-mt.json":   "prestate-mt",
 		}
 
 		// Build all prestate files directly in the target directory
 		if err := prestateBuilder.Build(buildDir); err != nil {
-			return "", fmt.Errorf("failed to build prestates: %w", err)
+			return nil, fmt.Errorf("failed to build prestates: %w", err)
 		}
 
-		// Find all prestate-proof*.json files
+		// Find and process all prestate files
 		matches, err := filepath.Glob(filepath.Join(buildDir, "prestate-proof*.json"))
 		if err != nil {
-			return "", fmt.Errorf("failed to find prestate files: %w", err)
+			return nil, fmt.Errorf("failed to find prestate files: %w", err)
 		}
 
 		// Process each file to rename it to its hash
 		for _, filePath := range matches {
 			content, err := os.ReadFile(filePath)
 			if err != nil {
-				return "", fmt.Errorf("failed to read prestate %s: %w", filepath.Base(filePath), err)
+				return nil, fmt.Errorf("failed to read prestate %s: %w", filepath.Base(filePath), err)
 			}
 
 			var data struct {
 				Pre string `json:"pre"`
 			}
 			if err := json.Unmarshal(content, &data); err != nil {
-				return "", fmt.Errorf("failed to parse prestate %s: %w", filepath.Base(filePath), err)
+				return nil, fmt.Errorf("failed to parse prestate %s: %w", filepath.Base(filePath), err)
 			}
 
-			// Rename the file to just the hash
-			hashedPath := filepath.Join(buildDir, data.Pre)
+			// Store hash with its corresponding key
+			if key, exists := fileToKey[filepath.Base(filePath)]; exists {
+				info.Hashes[key] = data.Pre
+			}
+
+			// Rename files to hash-based names
+			newFileName := data.Pre + ".json"
+			hashedPath := filepath.Join(buildDir, newFileName)
 			if err := os.Rename(filePath, hashedPath); err != nil {
-				return "", fmt.Errorf("failed to rename prestate %s: %w", filepath.Base(filePath), err)
+				return nil, fmt.Errorf("failed to rename prestate %s: %w", filepath.Base(filePath), err)
 			}
+			log.Printf("%s available at: %s/%s/%s\n", filepath.Base(filePath), server.URL(), relPath, newFileName)
 
-			log.Printf("%s available at: %s/%s/%s\n", filepath.Base(filePath), server.URL(), relPath, data.Pre)
+			// Rename the corresponding binary file
+			binFilePath := strings.Replace(strings.TrimSuffix(filePath, ".json"), "-proof", "", 1) + ".bin.gz"
+			newBinFileName := data.Pre + ".bin.gz"
+			binHashedPath := filepath.Join(buildDir, newBinFileName)
+			if err := os.Rename(binFilePath, binHashedPath); err != nil {
+				return nil, fmt.Errorf("failed to rename prestate %s: %w", filepath.Base(binFilePath), err)
+			}
+			log.Printf("%s available at: %s/%s/%s\n", filepath.Base(binFilePath), server.URL(), relPath, newBinFileName)
 		}
 
-		return url, nil
+		return info, nil
 	})
 }
 
-func renderTemplate(cfg *config, server *staticServer) (*bytes.Buffer, error) {
+func (m *Main) renderTemplate(server *staticServer) (*bytes.Buffer, error) {
 	opts := []tmpl.TemplateContextOptions{
-		localDockerImageOption(cfg),
-		localContractArtifactsOption(cfg, server),
-		localPrestateOption(cfg, server),
+		m.localDockerImageOption(),
+		m.localContractArtifactsOption(server),
+		m.localPrestateOption(server),
 	}
 
 	// Read and parse the data file if provided
-	if cfg.dataFile != "" {
-		data, err := os.ReadFile(cfg.dataFile)
+	if m.cfg.dataFile != "" {
+		data, err := os.ReadFile(m.cfg.dataFile)
 		if err != nil {
 			return nil, fmt.Errorf("error reading data file: %w", err)
 		}
@@ -216,7 +258,7 @@ func renderTemplate(cfg *config, server *staticServer) (*bytes.Buffer, error) {
 	}
 
 	// Open template file
-	tmplFile, err := os.Open(cfg.templateFile)
+	tmplFile, err := os.Open(m.cfg.templateFile)
 	if err != nil {
 		return nil, fmt.Errorf("error opening template file: %w", err)
 	}
@@ -234,7 +276,7 @@ func renderTemplate(cfg *config, server *staticServer) (*bytes.Buffer, error) {
 	return buf, nil
 }
 
-func deploy(ctx context.Context, cfg *config, r io.Reader) error {
+func (m *Main) deploy(ctx context.Context, r io.Reader) error {
 	// Create a multi reader to output deployment input to stdout
 	buf := bytes.NewBuffer(nil)
 	tee := io.TeeReader(r, buf)
@@ -245,30 +287,92 @@ func deploy(ctx context.Context, cfg *config, r io.Reader) error {
 		return fmt.Errorf("error copying deployment input: %w", err)
 	}
 
-	kurtosisDeployer := kurtosis.NewKurtosisDeployer(
-		kurtosis.WithKurtosisBaseDir(cfg.baseDir),
-		kurtosis.WithKurtosisDryRun(cfg.dryRun),
-		kurtosis.WithKurtosisPackageName(cfg.kurtosisPackage),
-		kurtosis.WithKurtosisEnclave(cfg.enclave),
-	)
-
-	env, err := kurtosisDeployer.Deploy(ctx, buf)
-	if err != nil {
-		return fmt.Errorf("error deploying kurtosis: %w", err)
+	opts := []kurtosis.KurtosisDeployerOptions{
+		kurtosis.WithKurtosisBaseDir(m.cfg.baseDir),
+		kurtosis.WithKurtosisDryRun(m.cfg.dryRun),
+		kurtosis.WithKurtosisPackageName(m.cfg.kurtosisPackage),
+		kurtosis.WithKurtosisEnclave(m.cfg.enclave),
 	}
 
-	envOutput := os.Stdout
-	if cfg.environment != "" {
-		envOutput, err = os.Create(cfg.environment)
+	d, err := m.newDeployer(opts...)
+	if err != nil {
+		return fmt.Errorf("error creating kurtosis deployer: %w", err)
+	}
+
+	spec, err := d.Deploy(ctx, buf)
+	if err != nil {
+		return fmt.Errorf("error deploying kurtosis package: %w", err)
+	}
+
+	env, err := d.GetEnvironmentInfo(ctx, spec)
+	if err != nil {
+		return fmt.Errorf("error getting environment: %w", err)
+	}
+
+	if err := writeEnvironment(m.cfg.environment, env); err != nil {
+		return fmt.Errorf("error writing environment: %w", err)
+	}
+
+	return nil
+}
+
+func (m *Main) deployFileserver(ctx context.Context, sourceDir string) error {
+	// Create a temp dir in the fileserver package
+	baseDir := filepath.Join(m.cfg.baseDir, FILESERVER_PACKAGE)
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return fmt.Errorf("error creating base directory: %w", err)
+	}
+	tempDir, err := os.MkdirTemp(baseDir, "upload-content")
+	if err != nil {
+		return fmt.Errorf("error creating temporary directory: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Copy build dir contents to tempDir
+	if err := util.CopyDir(sourceDir, tempDir); err != nil {
+		return fmt.Errorf("error copying directory: %w", err)
+	}
+
+	buf := bytes.NewBuffer(nil)
+	buf.WriteString(fmt.Sprintf("source_path: %s\n", filepath.Base(tempDir)))
+
+	opts := []kurtosis.KurtosisDeployerOptions{
+		kurtosis.WithKurtosisBaseDir(m.cfg.baseDir),
+		kurtosis.WithKurtosisDryRun(m.cfg.dryRun),
+		kurtosis.WithKurtosisPackageName(FILESERVER_PACKAGE),
+		kurtosis.WithKurtosisEnclave(m.cfg.enclave),
+	}
+
+	d, err := m.newDeployer(opts...)
+	if err != nil {
+		return fmt.Errorf("error creating kurtosis deployer: %w", err)
+	}
+
+	_, err = d.Deploy(ctx, buf)
+	if err != nil {
+		return fmt.Errorf("error deploying kurtosis package: %w", err)
+	}
+
+	return nil
+}
+
+type deployer interface {
+	Deploy(ctx context.Context, input io.Reader) (*spec.EnclaveSpec, error)
+	GetEnvironmentInfo(ctx context.Context, spec *spec.EnclaveSpec) (*kurtosis.KurtosisEnvironment, error)
+}
+
+func writeEnvironment(path string, env *kurtosis.KurtosisEnvironment) error {
+	out := os.Stdout
+	if path != "" {
+		var err error
+		out, err = os.Create(path)
 		if err != nil {
 			return fmt.Errorf("error creating environment file: %w", err)
 		}
-		defer envOutput.Close()
-	} else {
-		log.Println("\nEnvironment description:")
+		defer out.Close()
 	}
 
-	enc := json.NewEncoder(envOutput)
+	enc := json.NewEncoder(out)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(env); err != nil {
 		return fmt.Errorf("error encoding environment: %w", err)
@@ -277,22 +381,34 @@ func deploy(ctx context.Context, cfg *config, r io.Reader) error {
 	return nil
 }
 
-func mainFunc(cfg *config) error {
+func (m *Main) run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	server, cleanup, err := launchStaticServer(ctx, cfg)
+	if !m.cfg.dryRun {
+		if err := m.engineManager.EnsureRunning(); err != nil {
+			return fmt.Errorf("error ensuring kurtosis engine is running: %w", err)
+		}
+	}
+
+	server, cleanup, err := m.launchStaticServer(ctx)
 	if err != nil {
 		return fmt.Errorf("error launching static server: %w", err)
 	}
 	defer cleanup()
 
-	buf, err := renderTemplate(cfg, server)
+	buf, err := m.renderTemplate(server)
 	if err != nil {
 		return fmt.Errorf("error rendering template: %w", err)
 	}
 
-	return deploy(ctx, cfg, buf)
+	// TODO: clean up consumers of static server and replace with fileserver
+	err = m.deployFileserver(ctx, server.dir)
+	if err != nil {
+		return fmt.Errorf("error deploying fileserver: %w", err)
+	}
+
+	return m.deploy(ctx, buf)
 }
 
 func mainAction(c *cli.Context) error {
@@ -300,7 +416,14 @@ func mainAction(c *cli.Context) error {
 	if err != nil {
 		return fmt.Errorf("error parsing config: %w", err)
 	}
-	return mainFunc(cfg)
+	m := &Main{
+		cfg: cfg,
+		newDeployer: func(opts ...kurtosis.KurtosisDeployerOptions) (deployer, error) {
+			return kurtosis.NewKurtosisDeployer(opts...)
+		},
+		engineManager: engine.NewEngineManager(engine.WithKurtosisBinary(cfg.kurtosisBinary)),
+	}
+	return m.run()
 }
 
 func getFlags() []cli.Flag {
@@ -335,7 +458,12 @@ func getFlags() []cli.Flag {
 		&cli.StringFlag{
 			Name:  "local-hostname",
 			Usage: "DNS for localhost from Kurtosis perspective (optional)",
-			Value: "host.docker.internal",
+			Value: backend.DefaultDockerHost(),
+		},
+		&cli.StringFlag{
+			Name:  "kurtosis-binary",
+			Usage: "Path to kurtosis binary (optional)",
+			Value: "kurtosis",
 		},
 	}
 }

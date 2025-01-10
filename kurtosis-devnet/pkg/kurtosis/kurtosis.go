@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/ethereum-optimism/optimism/kurtosis-devnet/pkg/kurtosis/api/interfaces"
+	"github.com/ethereum-optimism/optimism/kurtosis-devnet/pkg/kurtosis/api/run"
+	"github.com/ethereum-optimism/optimism/kurtosis-devnet/pkg/kurtosis/api/wrappers"
 	"github.com/ethereum-optimism/optimism/kurtosis-devnet/pkg/kurtosis/sources/deployer"
 	"github.com/ethereum-optimism/optimism/kurtosis-devnet/pkg/kurtosis/sources/spec"
 )
@@ -25,6 +28,7 @@ type Chain struct {
 	Services  EndpointMap                  `json:"services,omitempty"`
 	Nodes     []Node                       `json:"nodes"`
 	Addresses deployer.DeploymentAddresses `json:"addresses,omitempty"`
+	Wallets   WalletMap                    `json:"wallets,omitempty"`
 }
 
 type Wallet struct {
@@ -36,9 +40,8 @@ type WalletMap map[string]Wallet
 
 // KurtosisEnvironment represents the output of a Kurtosis deployment
 type KurtosisEnvironment struct {
-	L1      *Chain    `json:"l1"`
-	L2      []*Chain  `json:"l2"`
-	Wallets WalletMap `json:"wallets"`
+	L1 *Chain   `json:"l1"`
+	L2 []*Chain `json:"l2"`
 }
 
 // KurtosisDeployer handles deploying packages using Kurtosis
@@ -55,8 +58,7 @@ type KurtosisDeployer struct {
 	enclaveSpec      EnclaveSpecifier
 	enclaveInspecter EnclaveInspecter
 	enclaveObserver  EnclaveObserver
-	kurtosisCtx      kurtosisContextInterface
-	runHandlers      []MessageHandler
+	kurtosisCtx      interfaces.KurtosisContextInterface
 }
 
 type KurtosisDeployerOptions func(*KurtosisDeployer)
@@ -103,14 +105,14 @@ func WithKurtosisEnclaveObserver(enclaveObserver EnclaveObserver) KurtosisDeploy
 	}
 }
 
-func WithKurtosisRunHandlers(runHandlers []MessageHandler) KurtosisDeployerOptions {
+func WithKurtosisKurtosisContext(kurtosisCtx interfaces.KurtosisContextInterface) KurtosisDeployerOptions {
 	return func(d *KurtosisDeployer) {
-		d.runHandlers = runHandlers
+		d.kurtosisCtx = kurtosisCtx
 	}
 }
 
 // NewKurtosisDeployer creates a new KurtosisDeployer instance
-func NewKurtosisDeployer(opts ...KurtosisDeployerOptions) *KurtosisDeployer {
+func NewKurtosisDeployer(opts ...KurtosisDeployerOptions) (*KurtosisDeployer, error) {
 	d := &KurtosisDeployer{
 		baseDir:     ".",
 		packageName: DefaultPackageName,
@@ -126,7 +128,15 @@ func NewKurtosisDeployer(opts ...KurtosisDeployerOptions) *KurtosisDeployer {
 		opt(d)
 	}
 
-	return d
+	if d.kurtosisCtx == nil {
+		var err error
+		d.kurtosisCtx, err = wrappers.GetDefaultKurtosisContext()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create Kurtosis context: %w", err)
+		}
+	}
+
+	return d, nil
 }
 
 func (d *KurtosisDeployer) getWallets(wallets deployer.WalletList) WalletMap {
@@ -141,7 +151,7 @@ func (d *KurtosisDeployer) getWallets(wallets deployer.WalletList) WalletMap {
 }
 
 // getEnvironmentInfo parses the input spec and inspect output to create KurtosisEnvironment
-func (d *KurtosisDeployer) getEnvironmentInfo(ctx context.Context, spec *spec.EnclaveSpec) (*KurtosisEnvironment, error) {
+func (d *KurtosisDeployer) GetEnvironmentInfo(ctx context.Context, spec *spec.EnclaveSpec) (*KurtosisEnvironment, error) {
 	inspectResult, err := d.enclaveInspecter.EnclaveInspect(ctx, d.enclave)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse inspect output: %w", err)
@@ -154,18 +164,22 @@ func (d *KurtosisDeployer) getEnvironmentInfo(ctx context.Context, spec *spec.En
 	}
 
 	env := &KurtosisEnvironment{
-		L2:      make([]*Chain, 0, len(spec.Chains)),
-		Wallets: d.getWallets(deployerState.Wallets),
+		L2: make([]*Chain, 0, len(spec.Chains)),
 	}
 
 	// Find L1 endpoint
 	finder := NewServiceFinder(inspectResult.UserServices)
 	if nodes, endpoints := finder.FindL1Endpoints(); len(nodes) > 0 {
-		env.L1 = &Chain{
+		chain := &Chain{
 			Name:     "Ethereum",
 			Services: endpoints,
 			Nodes:    nodes,
 		}
+		if deployerState.State != nil {
+			chain.Addresses = deployerState.State.Addresses
+			chain.Wallets = d.getWallets(deployerState.Wallets)
+		}
+		env.L1 = chain
 	}
 
 	// Find L2 endpoints
@@ -180,8 +194,13 @@ func (d *KurtosisDeployer) getEnvironmentInfo(ctx context.Context, spec *spec.En
 		}
 
 		// Add contract addresses if available
-		if addresses, ok := deployerState.State[chainSpec.NetworkID]; ok {
-			chain.Addresses = addresses
+		if deployerState.State != nil && deployerState.State.Deployments != nil {
+			if addresses, ok := deployerState.State.Deployments[chainSpec.NetworkID]; ok {
+				chain.Addresses = addresses.Addresses
+			}
+			if wallets, ok := deployerState.State.Deployments[chainSpec.NetworkID]; ok {
+				chain.Wallets = d.getWallets(wallets.Wallets)
+			}
 		}
 
 		env.L2 = append(env.L2, chain)
@@ -191,7 +210,7 @@ func (d *KurtosisDeployer) getEnvironmentInfo(ctx context.Context, spec *spec.En
 }
 
 // Deploy executes the Kurtosis deployment command with the provided input
-func (d *KurtosisDeployer) Deploy(ctx context.Context, input io.Reader) (*KurtosisEnvironment, error) {
+func (d *KurtosisDeployer) Deploy(ctx context.Context, input io.Reader) (*spec.EnclaveSpec, error) {
 	// Parse the input spec first
 	inputCopy := new(bytes.Buffer)
 	tee := io.TeeReader(input, inputCopy)
@@ -202,15 +221,24 @@ func (d *KurtosisDeployer) Deploy(ctx context.Context, input io.Reader) (*Kurtos
 	}
 
 	// Run kurtosis command
-	if err := d.runKurtosis(ctx, inputCopy); err != nil {
+	kurtosisRunner, err := run.NewKurtosisRunner(
+		run.WithKurtosisRunnerDryRun(d.dryRun),
+		run.WithKurtosisRunnerEnclave(d.enclave),
+		run.WithKurtosisRunnerKurtosisContext(d.kurtosisCtx),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Kurtosis runner: %w", err)
+	}
+
+	if err := kurtosisRunner.Run(ctx, d.packageName, inputCopy); err != nil {
 		return nil, err
 	}
 
 	// If dry run, return empty environment
 	if d.dryRun {
-		return &KurtosisEnvironment{}, nil
+		return spec, nil
 	}
 
 	// Get environment information
-	return d.getEnvironmentInfo(ctx, spec)
+	return spec, nil
 }
